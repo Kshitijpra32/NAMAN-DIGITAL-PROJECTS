@@ -1,5 +1,5 @@
-matplotlib==3.7.2
+streamlit==1.37.0
 pandas
 numpy
-streamlit
+matplotlib==3.7.2
 altair
