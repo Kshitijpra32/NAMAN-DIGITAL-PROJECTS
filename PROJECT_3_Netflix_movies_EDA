@@ -1,0 +1,33 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("/content/Netflix.csv")
+
+# Filter only movies + copy (important!)
+movies = df[df['type'] == 'Movie'].copy()
+
+# Extract Genre
+movies.loc[:, 'genre'] = movies['listed_in'].str.split(',').str[0]
+
+# Duration column
+movies.loc[:, 'duration_min'] = movies['duration'].str.replace(" min", "").astype(int)
+
+# Plot Genres
+movies['genre'].value_counts().head(10).plot(kind='bar')
+plt.xlabel("Genre")
+plt.ylabel("Count")
+plt.title("Most Common Netflix Movie Genres")
+plt.show()
+
+# Movie Duration
+movies['duration_min'].plot(kind='hist', bins=20)
+plt.title("Movie Duration Distribution")
+plt.xlabel("Minutes")
+plt.show()
+
+# Release Year trend
+movies['release_year'].value_counts().sort_index().plot(kind='line')
+plt.title("Netflix Movie Releases Over Time")
+plt.xlabel("Year")
+plt.ylabel("Number of Movies")
+plt.show()
