@@ -1,0 +1,143 @@
+# covid_timeseries_eda_forecast.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.seasonal import STL
+from prophet import Prophet
+import pmdarima as pm
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import math
+
+sns.set(style="whitegrid")
+plt.rcParams['figure.figsize'] = (12,5)
+
+# -------- 1. load data (OWID) ----------
+# Download the file manually or use:
+# owid_url = "https://covid.ourworldindata.org/data/owid-covid-data.csv"
+# df = pd.read_csv(owid_url, parse_dates=['date'])
+df = pd.read_csv("owid-covid-data.csv", parse_dates=['date'])
+
+# -------- 2. pick location and variables ----------
+country = "India"          # change to any country name or "World"
+if country.lower() == "world":
+    ts = df.groupby('date')[['new_cases','new_deaths']].sum().reset_index()
+else:
+    ts = df[df['location'] == country][['date','new_cases','new_deaths','total_cases','population']].copy()
+
+ts = ts.sort_values('date').reset_index(drop=True)
+
+# fill missing new_cases with 0 (or interpolate if you prefer)
+ts['new_cases'] = ts['new_cases'].fillna(0)
+ts['new_deaths'] = ts['new_deaths'].fillna(0)
+
+# per 100k population (if population column present)
+if 'population' in ts.columns:
+    pop = ts['population'].dropna().unique()
+    pop = pop[0] if len(pop)>0 else np.nan
+    if not np.isnan(pop):
+        ts['cases_per_100k'] = ts['new_cases'] / pop * 100000
+
+# ensure complete daily index (important for time series models)
+idx = pd.date_range(ts['date'].min(), ts['date'].max(), freq='D')
+ts = ts.set_index('date').reindex(idx).rename_axis('date').reset_index()
+# forward fill population and cumulative totals (if any)
+if 'population' in ts.columns:
+    ts['population'] = ts['population'].ffill().bfill()
+if 'total_cases' in ts.columns:
+    ts['total_cases'] = ts['total_cases'].ffill().bfill().fillna(0)
+
+# fill missing new_cases with 0 (after reindex)
+ts['new_cases'] = ts['new_cases'].fillna(0)
+
+# -------- 3. smoothing / rolling ----------
+ts['new_cases_smoothed'] = ts['new_cases'].rolling(window=7, center=True, min_periods=1).mean()
+
+# -------- 4. quick EDA plots ----------
+def plot_cases(ts):
+    fig, ax = plt.subplots(1,2, figsize=(14,5))
+    ax[0].plot(ts['date'], ts['new_cases'], label='Daily new cases', alpha=0.4)
+    ax[0].plot(ts['date'], ts['new_cases_smoothed'], label='7-day rolling', linewidth=2)
+    ax[0].set_title(f'Daily new COVID-19 cases — {country}')
+    ax[0].legend()
+    if 'cases_per_100k' in ts.columns:
+        ax[1].plot(ts['date'], ts['cases_per_100k'].rolling(7).mean())
+        ax[1].set_title('New cases per 100k (7-day avg)')
+    plt.tight_layout()
+    plt.show()
+
+plot_cases(ts)
+
+# cumulative
+if 'total_cases' in ts.columns:
+    plt.plot(ts['date'], ts['total_cases'])
+    plt.title(f'Cumulative cases — {country}')
+    plt.show()
+
+# -------- 5. STL decomposition (trend + seasonal + resid) ----------
+# Decompose the smoothed series (STL likes no zeros and numeric)
+series = ts.set_index('date')['new_cases_smoothed'].astype(float)
+stl = STL(series, period=7, robust=True)   # weekly seasonality
+res = stl.fit()
+res.plot()
+plt.suptitle(f'STL decomposition for {country}')
+plt.show()
+
+# -------- 6. Forecasting with Prophet ----------
+# Prepare DataFrame for Prophet
+prophet_df = ts[['date','new_cases']].rename(columns={'date':'ds','new_cases':'y'})
+# Prophet expects NaNs for missing y; keep zeros as zeros or set to NaN for days with no data?
+prophet_df['y'] = prophet_df['y'].astype(float)
+
+# train/test split
+h = 30  # forecast horizon days
+train = prophet_df.iloc[:-h]
+test  = prophet_df.iloc[-h:]
+
+m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
+# optionally add changepoints or holidays (policy changes) if you have them
+m.fit(train)
+
+future = m.make_future_dataframe(periods=h)
+forecast = m.predict(future)
+
+# plot
+m.plot(forecast)
+plt.title(f'Prophet forecast — {country}')
+plt.show()
+m.plot_components(forecast)
+plt.show()
+
+# Evaluate on test
+pred = forecast.set_index('ds')['yhat'].loc[test['ds']]
+mae = mean_absolute_error(test['y'], pred)
+rmse = math.sqrt(mean_squared_error(test['y'], pred))
+print(f'Prophet MAE={mae:.2f}, RMSE={rmse:.2f}')
+
+# -------- 7. ARIMA (auto_arima) as comparison ----------
+# use logged or differenced series if needed
+series_ar = ts.set_index('date')['new_cases'].astype(float)
+# small transform to avoid zeros issue
+series_ar = series_ar + 1.0
+train_ar = series_ar.iloc[:-h]
+test_ar  = series_ar.iloc[-h:]
+
+auto = pm.auto_arima(train_ar, seasonal=True, m=7, trace=True,
+                     error_action='ignore', suppress_warnings=True, stepwise=True)
+print(auto.summary())
+
+# forecast
+n_periods = h
+ar_forecast, confint = auto.predict(n_periods=n_periods, return_conf_int=True)
+ar_forecast = np.maximum(ar_forecast - 1.0, 0)   # revert transform
+
+# evaluate
+mae_ar = mean_absolute_error(test_ar - 1.0, ar_forecast)
+rmse_ar = math.sqrt(mean_squared_error(test_ar - 1.0, ar_forecast))
+print(f'ARIMA MAE={mae_ar:.2f}, RMSE={rmse_ar:.2f}')
+
+# Plot comparison
+plt.plot(test.index, test['y'].values, label='actual')
+plt.plot(test.index, pred.values, label='prophet_pred')
+plt.plot(test.index, ar_forecast, label='arima_pred')
+plt.legend(); plt.title('Forecast comparison (last %d days)'%h); plt.show()
